@@ -67,7 +67,7 @@ func checkDiskUsage(errors *[]string) {
 
 		var stat syscall.Statfs_t
 		if err := syscall.Statfs(mountpoint, &stat); err != nil {
-			fmt.Printf("  %-20s Error: %v\n", device, err)
+			*errors = append(*errors, fmt.Sprintf("Disk Usage: Statfs error on %s: %v", device, err))
 			continue
 		}
 
@@ -75,11 +75,20 @@ func checkDiskUsage(errors *[]string) {
 		total := stat.Blocks * blockSize
 		free := stat.Bfree * blockSize
 		used := total - free
-		usedPercent := float64(used) / float64(total) * 100
+
+		var usedPercent float64
+		if total > 0 {
+			usedPercent = float64(used) / float64(total) * 100
+		}
+
 		totalInodes := stat.Files
 		freeInodes := stat.Ffree
 		usedInodes := totalInodes - freeInodes
-		inodePercent := float64(usedInodes) / float64(totalInodes) * 100
+
+		var inodePercent float64
+		if totalInodes > 0 {
+			inodePercent = float64(usedInodes) / float64(totalInodes) * 100
+		}
 
 		fmt.Printf("  %-20s\n", device)
 		fmt.Printf("    Mountpoint: %-30s\n", mountpoint)
@@ -88,6 +97,7 @@ func checkDiskUsage(errors *[]string) {
 		fmt.Printf("    Available:  %-10.2f GB\n", float64(free)/1024/1024/1024)
 		fmt.Printf("    Use%%:       %-10.1f%%\n", usedPercent)
 		fmt.Printf("    Inodes:     %d/%d (%.1f%%)\n", usedInodes, totalInodes, inodePercent)
+
 		if usedPercent > 90 {
 			fmt.Printf("    %sWARNING: %s is over 90%% full!%s\n", colorYellow, device, colorReset)
 		}
@@ -157,11 +167,16 @@ func checkFilesystemIntegrity(errors *[]string) {
 		}
 
 		fmt.Printf("  Checking %-20s (%s, type %s)\n", device, mountpoint, fstype)
+		if mountpoint == "/" {
+			fmt.Printf("    %sSkipped root filesystem check (running fsck on / is unsafe while mounted).%s\n", colorYellow, colorReset)
+			continue
+		}
+
 		cmd := exec.Command("fsck", "-n", device)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
-			fmt.Printf("    %sError: %v\nOutput: %s%s\n", colorRed, err, string(output), colorReset)
 			*errors = append(*errors, fmt.Sprintf("Filesystem Integrity: fsck error on %s: %v", device, err))
+			fmt.Printf("    %sError: %v\nOutput: %s%s\n", colorRed, err, string(output), colorReset)
 		} else {
 			fmt.Printf("    %sClean: No issues found.%s\n", colorCyan, colorReset)
 		}
@@ -174,8 +189,8 @@ func checkFilesystemIntegrity(errors *[]string) {
 // checkIOErrors checks for I/O errors in dmesg
 func checkIOErrors(errors *[]string) {
 	printHeader("Recent I/O Errors")
-	cmd := exec.Command("dmesg")
-	output, err := cmd.Output()
+	cmd := exec.Command("dmesg", "--kernel", "--level=err,warn")
+	output, err := cmd.CombinedOutput()
 	if err != nil {
 		*errors = append(*errors, fmt.Sprintf("I/O Errors: failed to run dmesg: %v", err))
 		fmt.Printf("  %sError: Failed to run dmesg: %v%s\n", colorRed, err, colorReset)
@@ -183,47 +198,21 @@ func checkIOErrors(errors *[]string) {
 	}
 
 	lines := strings.Split(string(output), "\n")
-	found := false
-	for _, line := range lines {
-		if strings.Contains(strings.ToLower(line), "i/o error") ||
-			strings.Contains(strings.ToLower(line), "disk error") ||
-			strings.Contains(strings.ToLower(line), "filesystem error") {
-			fmt.Printf("  %s%s%s\n", colorRed, line, colorReset)
-			found = true
-		}
-	}
-	if !found {
+	if len(lines) == 0 || (len(lines) == 1 && lines[0] == "") {
 		fmt.Printf("  %sNo I/O or filesystem errors found.%s\n", colorCyan, colorReset)
-	}
-}
-
-// checkOpenFiles counts open file descriptors in /proc
-func checkOpenFiles(errors *[]string) {
-	printHeader("Open File Descriptors")
-	procDir := "/proc"
-	entries, err := os.ReadDir(procDir)
-	if err != nil {
-		*errors = append(*errors, fmt.Sprintf("Open Files: failed to read /proc: %v", err))
-		fmt.Printf("  %sError: Failed to read /proc: %v%s\n", colorRed, err, colorReset)
 		return
 	}
 
-	totalFds := 0
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
+	for _, line := range lines {
+		if line != "" {
+			fmt.Printf("  %s%s%s\n", colorRed, line, colorReset)
 		}
-		if _, err := strconv.Atoi(entry.Name()); err != nil {
-			continue
-		}
-		fdPath := filepath.Join(procDir, entry.Name(), "fd")
-		fds, err := os.ReadDir(fdPath)
-		if err != nil {
-			continue
-		}
-		totalFds += len(fds)
 	}
-	fmt.Printf("  Total Open FDs: %d\n", totalFds)
+}
+
+// checkOpenFiles counts open file descriptors using file-nr
+func checkOpenFiles(errors *[]string) {
+	printHeader("Open File Descriptors")
 
 	file, err := os.Open("/proc/sys/fs/file-nr")
 	if err != nil {
@@ -232,6 +221,7 @@ func checkOpenFiles(errors *[]string) {
 		return
 	}
 	defer file.Close()
+
 	scanner := bufio.NewScanner(file)
 	if scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
@@ -268,14 +258,12 @@ func checkSMARTStatus(errors *[]string) {
 		return
 	}
 
-	devices, err := filepath.Glob("/dev/sd[a-z]")
-	if err != nil {
-		*errors = append(*errors, fmt.Sprintf("SMART Status: failed to list block devices: %v", err))
-		fmt.Printf("  %sError: Failed to list block devices: %v%s\n", colorRed, err, colorReset)
-		return
-	}
+	devices, _ := filepath.Glob("/dev/sd[a-z]")
+	nvmeDevices, _ := filepath.Glob("/dev/nvme[0-9]n[0-9]")
+	devices = append(devices, nvmeDevices...)
+
 	if len(devices) == 0 {
-		fmt.Printf("  %sNo block devices found (/dev/sdX).%s\n", colorYellow, colorReset)
+		fmt.Printf("  %sNo block devices found (/dev/sdX or /dev/nvmeXnY).%s\n", colorYellow, colorReset)
 		return
 	}
 
@@ -284,8 +272,8 @@ func checkSMARTStatus(errors *[]string) {
 		cmd := exec.Command("smartctl", "-H", device)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
-			fmt.Printf("    %sError: %v\nOutput: %s%s\n", colorRed, err, string(output), colorReset)
 			*errors = append(*errors, fmt.Sprintf("SMART Status: error on %s: %v", device, err))
+			fmt.Printf("    %sError: %v\nOutput: %s%s\n", colorRed, err, string(output), colorReset)
 		} else if strings.Contains(string(output), "PASSED") {
 			fmt.Printf("    %sPASSED: SMART health OK.%s\n", colorCyan, colorReset)
 		} else {
@@ -296,7 +284,7 @@ func checkSMARTStatus(errors *[]string) {
 
 func main() {
 	startTime := time.Now()
-	fmt.Printf("%sFilesystem Check Started at %s%s\n", colorCyan, startTime.Format("2006-01-02 15:04:05 EEST"), colorReset)
+	fmt.Printf("%sFilesystem Check Started at %s%s\n", colorCyan, startTime.Format("2006-01-02 15:04:05 MST"), colorReset)
 
 	var errors []string
 	checkDiskUsage(&errors)
@@ -307,4 +295,7 @@ func main() {
 	checkSMARTStatus(&errors)
 
 	printSummary(startTime, errors)
+	if len(errors) > 0 {
+		os.Exit(1)
+	}
 }

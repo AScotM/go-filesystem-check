@@ -17,10 +17,16 @@ import (
 )
 
 const (
-	colorReset  = "\033[0m"
-	colorRed    = "\033[31m"
-	colorYellow = "\033[33m"
-	colorCyan   = "\033[36m"
+	colorReset   = "\033[0m"
+	colorRed     = "\033[38;5;203m"
+	colorOrange  = "\033[38;5;215m"
+	colorYellow  = "\033[38;5;227m"
+	colorGreen   = "\033[38;5;120m"
+	colorCyan    = "\033[38;5;87m"
+	colorBlue    = "\033[38;5;75m"
+	colorPurple  = "\033[38;5;141m"
+	colorGray    = "\033[38;5;245m"
+	colorDarkGray = "\033[38;5;238m"
 )
 
 type Config struct {
@@ -29,24 +35,30 @@ type Config struct {
 	Timeout          time.Duration
 	MaxFileSize      int64
 	ExcludeFS        []string
+	OutputJSON       bool
 }
 
 type DiskStats struct {
-	Device      string  `json:"device"`
-	Mountpoint  string  `json:"mountpoint"`
-	TotalGB     float64 `json:"total_gb"`
-	UsedGB      float64 `json:"used_gb"`
-	UsedPercent float64 `json:"used_percent"`
+	Device       string  `json:"device"`
+	Mountpoint   string  `json:"mountpoint"`
+	Filesystem   string  `json:"filesystem"`
+	TotalGB      float64 `json:"total_gb"`
+	UsedGB       float64 `json:"used_gb"`
+	AvailableGB  float64 `json:"available_gb"`
+	UsedPercent  float64 `json:"used_percent"`
 	InodePercent float64 `json:"inode_percent"`
-	Healthy     bool    `json:"healthy"`
+	Healthy      bool    `json:"healthy"`
+	Status       string  `json:"status"`
 }
 
 type CheckResult struct {
 	Timestamp time.Time   `json:"timestamp"`
 	Duration  string      `json:"duration"`
+	Hostname  string      `json:"hostname"`
 	Checks    []string    `json:"checks_performed"`
 	Errors    []string    `json:"errors"`
-	DiskStats []DiskStats `json:"disk_stats,omitempty"`
+	Warnings  []string    `json:"warnings"`
+	DiskStats []DiskStats `json:"disk_stats"`
 }
 
 var defaultConfig = Config{
@@ -55,32 +67,60 @@ var defaultConfig = Config{
 	Timeout:          30 * time.Second,
 	MaxFileSize:      1024 * 1024,
 	ExcludeFS:        []string{"tmpfs", "devtmpfs", "proc", "sysfs", "nfs", "cifs"},
+	OutputJSON:       false,
 }
 
 func printHeader(title string) {
-	fmt.Printf("%s┌──────────────────────────────────────────────┐%s\n", colorCyan, colorReset)
-	fmt.Printf("%s│ %-44s │%s\n", colorCyan, title, colorReset)
-	fmt.Printf("%s└──────────────────────────────────────────────┘%s\n", colorCyan, colorReset)
+	fmt.Printf("%s╔══════════════════════════════════════════════╗%s\n", colorPurple, colorReset)
+	fmt.Printf("%s║ %-44s ║%s\n", colorPurple, title, colorReset)
+	fmt.Printf("%s╚══════════════════════════════════════════════╝%s\n", colorPurple, colorReset)
 }
 
-func printSummary(startTime time.Time, errors []string) {
-	elapsed := time.Since(startTime).Round(time.Millisecond)
-	printHeader("Summary")
-	fmt.Printf("  Check completed at: %s\n", time.Now().Format("2006-01-02 15:04:05 MST"))
-	fmt.Printf("  Duration: %s\n", elapsed)
-	if len(errors) == 0 {
-		fmt.Printf("  Status: %sAll checks completed successfully%s\n", colorCyan, colorReset)
+func printStatus(status, message string) {
+	var color string
+	switch status {
+	case "OK":
+		color = colorGreen
+	case "WARN":
+		color = colorYellow
+	case "ERROR":
+		color = colorRed
+	case "INFO":
+		color = colorCyan
+	default:
+		color = colorGray
+	}
+	fmt.Printf("%s[%-5s]%s %s\n", color, status, colorReset, message)
+}
+
+func printSummary(result CheckResult) {
+	printHeader("SYSTEM CHECK SUMMARY")
+	fmt.Printf("%s  Hostname:    %s%s\n", colorBlue, result.Hostname, colorReset)
+	fmt.Printf("%s  Completed:   %s%s\n", colorBlue, result.Timestamp.Format("2006-01-02 15:04:05 MST"), colorReset)
+	fmt.Printf("%s  Duration:    %s%s\n", colorBlue, result.Duration, colorReset)
+	fmt.Printf("%s  Checks:      %d performed%s\n", colorBlue, len(result.Checks), colorReset)
+	
+	if len(result.Errors) == 0 && len(result.Warnings) == 0 {
+		printStatus("OK", "All systems operational")
 	} else {
-		fmt.Printf("  Status: %sIssues detected%s\n", colorRed, colorReset)
-		for i, err := range errors {
-			fmt.Printf("  Error %d: %s\n", i+1, err)
+		if len(result.Warnings) > 0 {
+			fmt.Printf("\n%s  Warnings:%s\n", colorYellow, colorReset)
+			for i, warn := range result.Warnings {
+				fmt.Printf("    %d. %s\n", i+1, warn)
+			}
+		}
+		if len(result.Errors) > 0 {
+			fmt.Printf("\n%s  Errors:%s\n", colorRed, colorReset)
+			for i, err := range result.Errors {
+				fmt.Printf("    %d. %s\n", i+1, err)
+			}
 		}
 	}
 }
 
 func safeGlob(pattern string) ([]string, error) {
-	if strings.Contains(pattern, "..") || strings.Contains(pattern, "//") {
-		return nil, fmt.Errorf("invalid pattern")
+	if strings.ContainsAny(pattern, "..*/") {
+		return nil, fmt.Errorf("invalid pattern: %s", pattern)
 	}
 	return filepath.Glob(pattern)
 }
@@ -91,6 +131,7 @@ func isAllowedCommand(cmd string) bool {
 		"dmesg":    true,
 		"fsck":     true,
 		"blkid":    true,
+		"lsblk":    true,
 	}
 	return allowed[cmd]
 }
@@ -128,27 +169,32 @@ func readProcMounts(config Config) ([]string, error) {
 	return mounts, scanner.Err()
 }
 
-func withRecovery(name string, fn func() error, errors *[]string) {
+func withRecovery(name string, fn func() ([]string, []string)) ([]string, []string) {
+	var errors, warnings []string
 	defer func() {
 		if r := recover(); r != nil {
-			*errors = append(*errors, fmt.Sprintf("%s: panic: %v", name, r))
+			errors = append(errors, fmt.Sprintf("%s: panic: %v", name, r))
 		}
 	}()
 	
-	if err := fn(); err != nil {
-		*errors = append(*errors, fmt.Sprintf("%s: %v", name, err))
-	}
+	newErrors, newWarnings := fn()
+	errors = append(errors, newErrors...)
+	warnings = append(warnings, newWarnings...)
+	return errors, warnings
 }
 
-func checkDiskUsage(ctx context.Context, config Config, errors *[]string) error {
-	printHeader("Disk Usage")
-	mounts, err := readProcMounts(config)
-	if err != nil {
-		return fmt.Errorf("failed to read /proc/mounts: %v", err)
+func checkDiskUsage(ctx context.Context, config Config) ([]string, []string) {
+	var errors, warnings []string
+	
+	if !config.OutputJSON {
+		printHeader("DISK USAGE ANALYSIS")
 	}
 
-	var diskStats []DiskStats
-	
+	mounts, err := readProcMounts(config)
+	if err != nil {
+		return []string{fmt.Sprintf("Disk Usage: %v", err)}, warnings
+	}
+
 	for _, line := range mounts {
 		fields := strings.Fields(line)
 		if len(fields) < 4 {
@@ -161,7 +207,7 @@ func checkDiskUsage(ctx context.Context, config Config, errors *[]string) error 
 
 		var stat syscall.Statfs_t
 		if err := syscall.Statfs(mountpoint, &stat); err != nil {
-			*errors = append(*errors, fmt.Sprintf("Disk Usage: Statfs error on %s: %v", device, err))
+			errors = append(errors, fmt.Sprintf("Disk Usage: Statfs error on %s: %v", device, err))
 			continue
 		}
 
@@ -184,44 +230,48 @@ func checkDiskUsage(ctx context.Context, config Config, errors *[]string) error 
 			inodePercent = float64(usedInodes) / float64(totalInodes) * 100
 		}
 
-		healthy := usedPercent <= 90 && inodePercent <= 90
-		
-		stats := DiskStats{
-			Device:      device,
-			Mountpoint:  mountpoint,
-			TotalGB:     float64(total) / 1024 / 1024 / 1024,
-			UsedGB:      float64(used) / 1024 / 1024 / 1024,
-			UsedPercent: usedPercent,
-			InodePercent: inodePercent,
-			Healthy:     healthy,
+		status := "OK"
+		if usedPercent > 95 || inodePercent > 95 {
+			status = "ERROR"
+			errors = append(errors, fmt.Sprintf("Disk Usage: %s is critically full (%.1f%%)", device, usedPercent))
+		} else if usedPercent > 85 || inodePercent > 85 {
+			status = "WARN"
+			warnings = append(warnings, fmt.Sprintf("Disk Usage: %s is nearly full (%.1f%%)", device, usedPercent))
 		}
-		diskStats = append(diskStats, stats)
 
-		fmt.Printf("  %-20s\n", device)
-		fmt.Printf("    Mountpoint: %-30s\n", mountpoint)
-		fmt.Printf("    Size:       %-10.2f GB\n", stats.TotalGB)
-		fmt.Printf("    Used:       %-10.2f GB\n", stats.UsedGB)
-		fmt.Printf("    Available:  %-10.2f GB\n", float64(free)/1024/1024/1024)
-		fmt.Printf("    Use%%:       %-10.1f%%\n", usedPercent)
-		fmt.Printf("    Inodes:     %d/%d (%.1f%%)\n", usedInodes, totalInodes, inodePercent)
-
-		if usedPercent > 90 {
-			fmt.Printf("    %sWARNING: %s is over 90%% full!%s\n", colorYellow, device, colorReset)
+		if !config.OutputJSON {
+			fmt.Printf("\n%s%s%s\n", colorCyan, device, colorReset)
+			fmt.Printf("  %sMountpoint:%s %s\n", colorGray, colorReset, mountpoint)
+			fmt.Printf("  %sFilesystem:%s %s\n", colorGray, colorReset, fstype)
+			fmt.Printf("  %sSize:      %s%10.2f GB%s\n", colorGray, colorBlue, float64(total)/1073741824, colorReset)
+			fmt.Printf("  %sUsed:      %s%10.2f GB%s %s(%.1f%%)%s\n", colorGray, colorOrange, float64(used)/1073741824, colorReset, colorGray, usedPercent, colorReset)
+			fmt.Printf("  %sAvailable: %s%10.2f GB%s\n", colorGray, colorGreen, float64(free)/1073741824, colorReset)
+			fmt.Printf("  %sInodes:    %s%10d/%d%s %s(%.1f%%)%s\n", colorGray, colorPurple, usedInodes, totalInodes, colorReset, colorGray, inodePercent, colorReset)
+			
+			switch status {
+			case "OK":
+				printStatus("OK", "Disk space adequate")
+			case "WARN":
+				printStatus("WARN", "Disk space low")
+			case "ERROR":
+				printStatus("ERROR", "Disk space critical")
+			}
 		}
-		if inodePercent > 90 {
-			fmt.Printf("    %sWARNING: %s has over 90%% inode usage!%s\n", colorYellow, device, colorReset)
-		}
-		fmt.Println()
 	}
 	
-	return nil
+	return errors, warnings
 }
 
-func checkMountedFilesystems(ctx context.Context, config Config, errors *[]string) error {
-	printHeader("Mounted Filesystems")
+func checkMountedFilesystems(ctx context.Context, config Config) ([]string, []string) {
+	var errors, warnings []string
+	
+	if !config.OutputJSON {
+		printHeader("MOUNTED FILESYSTEMS")
+	}
+
 	mounts, err := readProcMounts(config)
 	if err != nil {
-		return fmt.Errorf("failed to read /proc/mounts: %v", err)
+		return []string{fmt.Sprintf("Mounted Filesystems: %v", err)}, warnings
 	}
 
 	for _, line := range mounts {
@@ -229,33 +279,35 @@ func checkMountedFilesystems(ctx context.Context, config Config, errors *[]strin
 		if len(fields) < 4 {
 			continue
 		}
-		fmt.Printf("  Device:       %-30s\n", fields[0])
-		fmt.Printf("  Mountpoint:   %-30s\n", fields[1])
-		fmt.Printf("  Type:         %-15s\n", fields[2])
-		fmt.Printf("  Options:      %-30s\n", fields[3])
-		fmt.Println()
+		
+		if !config.OutputJSON {
+			fmt.Printf("\n%s%s%s\n", colorCyan, fields[0], colorReset)
+			fmt.Printf("  %sMountpoint:%s %s\n", colorGray, colorReset, fields[1])
+			fmt.Printf("  %sType:      %s %s\n", colorGray, colorReset, fields[2])
+			fmt.Printf("  %sOptions:   %s %s\n", colorGray, colorReset, fields[3])
+		}
 	}
-	return nil
+	return errors, warnings
 }
 
-func detectFilesystemType(ctx context.Context, device string) (string, error) {
-	output, err := safeExecCommand(ctx, "blkid", "-o", "value", "-s", "TYPE", device)
-	if err != nil {
-		return "", err
+func checkFilesystemIntegrity(ctx context.Context, config Config) ([]string, []string) {
+	var errors, warnings []string
+	
+	if !config.OutputJSON {
+		printHeader("FILESYSTEM INTEGRITY")
 	}
-	return strings.TrimSpace(string(output)), nil
-}
 
-func checkFilesystemIntegrity(ctx context.Context, config Config, errors *[]string) error {
-	printHeader("Filesystem Integrity Check")
 	if os.Geteuid() != 0 {
-		fmt.Printf("  %sSkipped: Requires root privileges.%s\n", colorYellow, colorReset)
-		return nil
+		warnings = append(warnings, "Filesystem Integrity: Requires root privileges")
+		if !config.OutputJSON {
+			printStatus("WARN", "Skipped - requires root privileges")
+		}
+		return errors, warnings
 	}
 
 	mounts, err := readProcMounts(config)
 	if err != nil {
-		return fmt.Errorf("failed to read /proc/mounts: %v", err)
+		return []string{fmt.Sprintf("Filesystem Integrity: %v", err)}, warnings
 	}
 
 	for _, line := range mounts {
@@ -268,56 +320,88 @@ func checkFilesystemIntegrity(ctx context.Context, config Config, errors *[]stri
 			continue
 		}
 
-		fmt.Printf("  Checking %-20s (%s, type %s)\n", device, mountpoint, fstype)
+		if !config.OutputJSON {
+			fmt.Printf("\n%sChecking:%s %s\n", colorGray, colorReset, device)
+		}
+
 		if mountpoint == "/" {
-			fmt.Printf("    %sSkipped root filesystem check (running fsck on / is unsafe while mounted).%s\n", colorYellow, colorReset)
+			warnings = append(warnings, fmt.Sprintf("Filesystem Integrity: Skipped root filesystem %s", device))
+			if !config.OutputJSON {
+				printStatus("WARN", "Skipped root filesystem (unsafe while mounted)")
+			}
 			continue
 		}
 
 		cmdCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		output, err := safeExecCommand(cmdCtx, "fsck", "-n", device)
+		_, err := safeExecCommand(cmdCtx, "fsck", "-n", device)
 		cancel()
 		
 		if err != nil {
-			*errors = append(*errors, fmt.Sprintf("Filesystem Integrity: fsck error on %s: %v", device, err))
-			fmt.Printf("    %sError: %v\nOutput: %s%s\n", colorRed, err, string(output), colorReset)
+			errors = append(errors, fmt.Sprintf("Filesystem Integrity: %s: %v", device, err))
+			if !config.OutputJSON {
+				printStatus("ERROR", fmt.Sprintf("Check failed: %v", err))
+			}
 		} else {
-			fmt.Printf("    %sClean: No issues found.%s\n", colorCyan, colorReset)
+			if !config.OutputJSON {
+				printStatus("OK", "No filesystem errors detected")
+			}
 		}
 	}
-	return nil
+	return errors, warnings
 }
 
-func checkIOErrors(ctx context.Context, config Config, errors *[]string) error {
-	printHeader("Recent I/O Errors")
+func checkIOErrors(ctx context.Context, config Config) ([]string, []string) {
+	var errors, warnings []string
+	
+	if !config.OutputJSON {
+		printHeader("I/O ERROR SCAN")
+	}
+
 	cmdCtx, cancel := context.WithTimeout(ctx, config.Timeout)
 	defer cancel()
 	
 	output, err := safeExecCommand(cmdCtx, "dmesg", "--kernel", "--level=err,warn")
 	if err != nil {
-		return fmt.Errorf("failed to run dmesg: %v", err)
+		return []string{fmt.Sprintf("I/O Errors: %v", err)}, warnings
 	}
 
-	lines := strings.Split(string(output), "\n")
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
 	if len(lines) == 0 || (len(lines) == 1 && lines[0] == "") {
-		fmt.Printf("  %sNo I/O or filesystem errors found.%s\n", colorCyan, colorReset)
-		return nil
+		if !config.OutputJSON {
+			printStatus("OK", "No recent I/O errors found")
+		}
+		return errors, warnings
+	}
+
+	errorCount := len(lines)
+	if errorCount > 10 {
+		lines = lines[:10]
+		warnings = append(warnings, fmt.Sprintf("I/O Errors: Showing first 10 of %d errors", errorCount))
 	}
 
 	for _, line := range lines {
-		if line != "" {
-			fmt.Printf("  %s%s%s\n", colorRed, line, colorReset)
+		errors = append(errors, fmt.Sprintf("I/O Error: %s", line))
+		if !config.OutputJSON {
+			fmt.Printf("%s%s%s\n", colorRed, line, colorReset)
 		}
 	}
-	return nil
+	
+	if !config.OutputJSON {
+		printStatus("ERROR", fmt.Sprintf("Found %d I/O errors", errorCount))
+	}
+	return errors, warnings
 }
 
-func checkOpenFiles(ctx context.Context, config Config, errors *[]string) error {
-	printHeader("Open File Descriptors")
+func checkOpenFiles(ctx context.Context, config Config) ([]string, []string) {
+	var errors, warnings []string
+	
+	if !config.OutputJSON {
+		printHeader("FILE DESCRIPTOR USAGE")
+	}
 
 	file, err := os.Open("/proc/sys/fs/file-nr")
 	if err != nil {
-		return fmt.Errorf("failed to read /proc/sys/fs/file-nr: %v", err)
+		return []string{fmt.Sprintf("Open Files: %v", err)}, warnings
 	}
 	defer file.Close()
 
@@ -326,46 +410,68 @@ func checkOpenFiles(ctx context.Context, config Config, errors *[]string) error 
 		fields := strings.Fields(scanner.Text())
 		if len(fields) >= 3 {
 			used, _, max := fields[0], fields[1], fields[2]
-			usedNum, err := strconv.Atoi(used)
-			if err != nil {
-				return fmt.Errorf("failed to parse used file descriptors: %v", err)
-			}
-			maxNum, err := strconv.Atoi(max)
-			if err != nil {
-				return fmt.Errorf("failed to parse max file descriptors: %v", err)
-			}
-			percent := float64(usedNum) / float64(maxNum) * 100
-			fmt.Printf("  System-wide: %s/%s (%.1f%%)\n", used, max, percent)
-			if percent > 90 {
-				fmt.Printf("  %sWARNING: File descriptor usage is over 90%%!%s\n", colorYellow, colorReset)
+			usedNum, _ := strconv.Atoi(used)
+			maxNum, _ := strconv.Atoi(max)
+			
+			if maxNum > 0 {
+				percent := float64(usedNum) / float64(maxNum) * 100
+				
+				if !config.OutputJSON {
+					fmt.Printf("%sUsed:%s  %s%d%s\n", colorGray, colorReset, colorBlue, usedNum, colorReset)
+					fmt.Printf("%sMax:%s   %s%d%s\n", colorGray, colorReset, colorGray, maxNum, colorReset)
+					fmt.Printf("%sUsage:%s %s%.1f%%%s\n", colorGray, colorReset, colorCyan, percent, colorReset)
+				}
+				
+				if percent > 95 {
+					errors = append(errors, fmt.Sprintf("Open Files: Critical usage at %.1f%%", percent))
+					if !config.OutputJSON {
+						printStatus("ERROR", "File descriptor usage critical")
+					}
+				} else if percent > 85 {
+					warnings = append(warnings, fmt.Sprintf("Open Files: High usage at %.1f%%", percent))
+					if !config.OutputJSON {
+						printStatus("WARN", "File descriptor usage high")
+					}
+				} else {
+					if !config.OutputJSON {
+						printStatus("OK", "File descriptor usage normal")
+					}
+				}
 			}
 		}
 	}
-	return scanner.Err()
+	
+	if err := scanner.Err(); err != nil {
+		errors = append(errors, fmt.Sprintf("Open Files: %v", err))
+	}
+	return errors, warnings
 }
 
-func checkSMARTStatus(ctx context.Context, config Config, errors *[]string) error {
-	printHeader("SMART Health Status")
-	cmd := exec.Command("smartctl", "--version")
-	if err := cmd.Run(); err != nil {
-		fmt.Printf("  %sSkipped: smartctl not found. Install 'smartmontools'.%s\n", colorYellow, colorReset)
-		return nil
+func checkSMARTStatus(ctx context.Context, config Config) ([]string, []string) {
+	var errors, warnings []string
+	
+	if !config.OutputJSON {
+		printHeader("SMART HEALTH STATUS")
 	}
 
-	devices, err := safeGlob("/dev/sd[a-z]")
-	if err != nil {
-		return fmt.Errorf("invalid device pattern: %v", err)
+	if _, err := exec.LookPath("smartctl"); err != nil {
+		warnings = append(warnings, "SMART Status: smartctl not found")
+		if !config.OutputJSON {
+			printStatus("WARN", "smartctl not installed")
+		}
+		return errors, warnings
 	}
-	
-	nvmeDevices, err := safeGlob("/dev/nvme[0-9]n[0-9]")
-	if err != nil {
-		return fmt.Errorf("invalid NVMe pattern: %v", err)
-	}
+
+	devices, _ := safeGlob("/dev/sd[a-z]")
+	nvmeDevices, _ := safeGlob("/dev/nvme[0-9]n[0-9]")
 	devices = append(devices, nvmeDevices...)
 
 	if len(devices) == 0 {
-		fmt.Printf("  %sNo block devices found (/dev/sdX or /dev/nvmeXnY).%s\n", colorYellow, colorReset)
-		return nil
+		warnings = append(warnings, "SMART Status: No storage devices detected")
+		if !config.OutputJSON {
+			printStatus("WARN", "No storage devices found")
+		}
+		return errors, warnings
 	}
 
 	var wg sync.WaitGroup
@@ -376,10 +482,9 @@ func checkSMARTStatus(ctx context.Context, config Config, errors *[]string) erro
 		go func(dev string) {
 			defer wg.Done()
 			
-			cmdCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			cmdCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			defer cancel()
 			
-			fmt.Printf("  Checking %-20s\n", dev)
 			output, err := safeExecCommand(cmdCtx, "smartctl", "-H", dev)
 			
 			mu.Lock()
@@ -387,21 +492,34 @@ func checkSMARTStatus(ctx context.Context, config Config, errors *[]string) erro
 			
 			if err != nil {
 				if cmdCtx.Err() == context.DeadlineExceeded {
-					*errors = append(*errors, fmt.Sprintf("SMART Status: timeout on %s", dev))
-					fmt.Printf("    %sTimeout: Device check timed out.%s\n", colorRed, colorReset)
+					errors = append(errors, fmt.Sprintf("SMART Status: %s timeout", dev))
 				} else {
-					*errors = append(*errors, fmt.Sprintf("SMART Status: error on %s: %v", dev, err))
-					fmt.Printf("    %sError: %v\nOutput: %s%s\n", colorRed, err, string(output), colorReset)
+					warnings = append(warnings, fmt.Sprintf("SMART Status: %s: %v", dev, err))
 				}
-			} else if strings.Contains(string(output), "PASSED") {
-				fmt.Printf("    %sPASSED: SMART health OK.%s\n", colorCyan, colorReset)
+			} else if strings.Contains(string(output), "PASSED") || strings.Contains(string(output), "OK") {
+				if !config.OutputJSON {
+					fmt.Printf("%s%s%s ", colorGreen, dev, colorReset)
+					printStatus("OK", "Healthy")
+				}
 			} else {
-				fmt.Printf("    %sCheck: %s%s\n", colorYellow, string(output), colorReset)
+				errors = append(errors, fmt.Sprintf("SMART Status: %s may be failing", dev))
+				if !config.OutputJSON {
+					fmt.Printf("%s%s%s ", colorRed, dev, colorReset)
+					printStatus("ERROR", "Check advised")
+				}
 			}
 		}(device)
 	}
 	wg.Wait()
-	return nil
+	return errors, warnings
+}
+
+func getHostname() string {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return "unknown"
+	}
+	return hostname
 }
 
 func main() {
@@ -410,42 +528,72 @@ func main() {
 	
 	go func() {
 		<-ctx.Done()
-		fmt.Printf("\n%sReceived interrupt, shutting down...%s\n", colorYellow, colorReset)
+		fmt.Printf("\n%s✗ Monitoring interrupted%s\n", colorRed, colorReset)
 		os.Exit(1)
 	}()
 	
 	startTime := time.Now()
-	fmt.Printf("%sFilesystem Check Started at %s%s\n", colorCyan, startTime.Format("2006-01-02 15:04:05 MST"), colorReset)
+	hostname := getHostname()
+	
+	if !defaultConfig.OutputJSON {
+		fmt.Printf("%s🖥️  SYSTEM STORAGE ANALYSIS%s\n", colorPurple, colorReset)
+		fmt.Printf("%sHost: %s%s\n\n", colorGray, hostname, colorReset)
+	}
 
-	var errors []string
-	config := defaultConfig
+	var allErrors, allWarnings []string
+	checks := []string{"Disk Usage", "Mounted Filesystems", "Filesystem Integrity", "I/O Errors", "Open Files", "SMART Status"}
 	
-	withRecovery("Disk Usage", func() error {
-		return checkDiskUsage(ctx, config, &errors)
-	}, &errors)
+	diskErrors, diskWarnings := withRecovery("Disk Usage", func() ([]string, []string) {
+		return checkDiskUsage(ctx, defaultConfig)
+	})
+	allErrors = append(allErrors, diskErrors...)
+	allWarnings = append(allWarnings, diskWarnings...)
 	
-	withRecovery("Mounted Filesystems", func() error {
-		return checkMountedFilesystems(ctx, config, &errors)
-	}, &errors)
+	mountErrors, mountWarnings := withRecovery("Mounted Filesystems", func() ([]string, []string) {
+		return checkMountedFilesystems(ctx, defaultConfig)
+	})
+	allErrors = append(allErrors, mountErrors...)
+	allWarnings = append(allWarnings, mountWarnings...)
 	
-	withRecovery("Filesystem Integrity", func() error {
-		return checkFilesystemIntegrity(ctx, config, &errors)
-	}, &errors)
+	fsErrors, fsWarnings := withRecovery("Filesystem Integrity", func() ([]string, []string) {
+		return checkFilesystemIntegrity(ctx, defaultConfig)
+	})
+	allErrors = append(allErrors, fsErrors...)
+	allWarnings = append(allWarnings, fsWarnings...)
 	
-	withRecovery("I/O Errors", func() error {
-		return checkIOErrors(ctx, config, &errors)
-	}, &errors)
+	ioErrors, ioWarnings := withRecovery("I/O Errors", func() ([]string, []string) {
+		return checkIOErrors(ctx, defaultConfig)
+	})
+	allErrors = append(allErrors, ioErrors...)
+	allWarnings = append(allWarnings, ioWarnings...)
 	
-	withRecovery("Open Files", func() error {
-		return checkOpenFiles(ctx, config, &errors)
-	}, &errors)
+	fileErrors, fileWarnings := withRecovery("Open Files", func() ([]string, []string) {
+		return checkOpenFiles(ctx, defaultConfig)
+	})
+	allErrors = append(allErrors, fileErrors...)
+	allWarnings = append(allWarnings, fileWarnings...)
 	
-	withRecovery("SMART Status", func() error {
-		return checkSMARTStatus(ctx, config, &errors)
-	}, &errors)
+	smartErrors, smartWarnings := withRecovery("SMART Status", func() ([]string, []string) {
+		return checkSMARTStatus(ctx, defaultConfig)
+	})
+	allErrors = append(allErrors, smartErrors...)
+	allWarnings = append(allWarnings, smartWarnings...)
 
-	printSummary(startTime, errors)
-	if len(errors) > 0 {
+	result := CheckResult{
+		Timestamp: time.Now(),
+		Duration:  time.Since(startTime).Round(time.Millisecond).String(),
+		Hostname:  hostname,
+		Checks:    checks,
+		Errors:    allErrors,
+		Warnings:  allWarnings,
+	}
+
+	if !defaultConfig.OutputJSON {
+		fmt.Println()
+		printSummary(result)
+	}
+
+	if len(allErrors) > 0 {
 		os.Exit(1)
 	}
 }
